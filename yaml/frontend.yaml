@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: sd-frontend
+  name: sd-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sd-frontend
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: sd-frontend
+    spec:
+      containers:
+      - image: ghcr.io/kwkoo/kserve-sd-frontend
+        name: kserve-sd-frontend
+        ports:
+        - name: http
+          containerPort: 8080
+        env:
+        - name: MODELURL
+          value: http://sd-internal:8080/v2/models/sd/infer
+        resources: {}
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: sd-frontend
+  name: sd-frontend
+spec:
+  ports:
+  - name: http
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: sd-frontend
+status:
+  loadBalancer: {}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  labels:
+    app: sd-frontend
+  name: sd-frontend
+spec:
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Allow
+  port:
+    targetPort: 8080
+  to:
+    name: sd-frontend
+    weight: null
+status: {}

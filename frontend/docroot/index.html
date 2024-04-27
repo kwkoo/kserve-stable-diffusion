@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Text to Image</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js"></script>
+</head>
+<body onload="initialize()">
+
+  <div class="title">Text to Image</div>
+  <div class="grid-columns">
+    <div class="label grid-item">Prompt</div>
+    <input class="grid-item" id="prompt" type="text" size="50" onkeydown="lookForEnter()"/>
+  </div>
+  <button id="query-button" onclick="query()">Query</button>
+  <img src="ajax-loader.gif" id="spinner"/>
+  <img id="model-image"/>
+
+</body>
+</html>
