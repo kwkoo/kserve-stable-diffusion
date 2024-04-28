@@ -1,0 +1,162 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    job: setup-s3
+  name: setup-s3
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    job: setup-s3
+  name: setup-s3
+spec:
+  template:
+    metadata:
+      labels:
+        job: setup-s3
+    spec:
+      serviceAccountName: setup-s3
+      containers:
+      - image: ghcr.io/kwkoo/s3-utils
+        name: setup-s3
+        workingDir: /work
+        command:
+        - /bin/bash
+        - "-c"
+        - |
+          until curl -s -o /dev/null $AWS_ENDPOINT_URL_S3 2>/dev/null; do
+            echo "waiting for minio API..."
+            sleep 5
+          done
+          mc alias set minio $AWS_ENDPOINT_URL_S3 $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY
+
+          echo "creating bucket..."
+          mc mb minio/models
+
+          echo "cloning model..."
+          git clone https://huggingface.co/OFA-Sys/small-stable-diffusion-v0 model
+          cd model
+          rm -rf .git *.jpg
+
+          echo "creating model.zip..."
+          zip -r ../model.zip .
+          cd ..
+          rm -rf model
+
+          echo "creating .mar..."
+          /usr/local/bin/torch-model-archiver \
+            --model-name sd \
+            --version 1.0 \
+            --serialized-file model.zip \
+            --handler /data/custom_handler.py \
+            -r /data/requirements.txt
+          
+          echo "uploading to s3 bucket..."
+          python3 /data/upload_to_s3.py
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio
+              key: MINIO_ROOT_USER
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio
+              key: MINIO_ROOT_PASSWORD
+        - name: AWS_ENDPOINT_URL_S3
+          value: "http://minio:9000"
+        - name: MC_INSECURE
+          value: "true"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+          readOnly: true
+        - name: work
+          mountPath: /work
+        resources: {}
+      restartPolicy: Never
+      volumes:
+      - name: data
+        configMap:
+          name: setup-s3
+      - name: work
+        emptyDir: {}
+status: {}
+---
+apiVersion: v1
+data:
+  config.properties: |
+    inference_address=http://0.0.0.0:8085
+    management_address=http://0.0.0.0:8085
+    metrics_address=http://0.0.0.0:8082
+    grpc_inference_port=7070
+    grpc_management_port=7071
+    enable_metrics_api=true
+    metrics_mode=prometheus
+    metrics_format=prometheus
+    number_of_netty_threads=4
+    job_queue_size=10
+    enable_envvars_config=true
+    install_py_dep_per_model=true
+    model_store=/mnt/models/model-store
+    model_snapshot={"name":"startup.cfg","modelCount":1,"models":{"sd":{"1.0":{"defaultVersion":true,"marName":"sd.mar","minWorkers":1,"maxWorkers":1,"batchSize":1,"maxBatchDelay":10,"responseTimeout":120}}}}
+  upload_to_s3.py: |
+    #!/usr/bin/env python3
+
+    import boto3
+    import os
+
+    if __name__ == '__main__':
+        bucket = os.environ.get('S3_BUCKET', 'models')
+        session = boto3.session.Session()
+        s3_client = session.client(
+                service_name='s3',
+                aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+                aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+                endpoint_url=os.environ.get('AWS_ENDPOINT_URL_S3')
+            )
+
+        s3_client.upload_file("/data/config.properties", bucket, "config/config.properties")
+        s3_client.upload_file("sd.mar", bucket, "model-store/sd.mar")
+  custom_handler.py: "import logging\nimport os\nimport zipfile\nimport tempfile\nimport
+    io\nimport torch\nimport base64\nfrom diffusers import StableDiffusionPipeline\nfrom
+    ts.torch_handler.base_handler import BaseHandler\n\n\nlogger = logging.getLogger(__name__)\n\ntry:\n
+    \   import torch_xla.core.xla_model as xm\n\n    XLA_AVAILABLE = True\nexcept
+    ImportError as error:\n    XLA_AVAILABLE = False\n\n\nclass StableDiffusionHandler(BaseHandler):\n\n
+    \   def __init__(self):\n        super(StableDiffusionHandler, self).__init__()\n
+    \       self._context = None\n        self.initialized = False\n\n\n    def initialize(self,
+    context):\n        self._context = context\n\n        # Set device type\n        if
+    torch.cuda.is_available():\n            self.device = torch.device(\"cuda\")\n
+    \       elif torch.backends.mps is not None and torch.backends.mps.is_available():\n
+    \           self.device = torch.device(\"mps\")\n        elif XLA_AVAILABLE:\n
+    \           self.device = xm.xla_device()\n        else:\n            self.device
+    = torch.device(\"cpu\")\n\n        logger.info(\"torch device = %s\", self.device)\n\n
+    \       # Load the model\n        properties = context.system_properties\n        self.manifest
+    = context.manifest\n        model_dir = properties.get(\"model_dir\")\n        if
+    self.manifest[\"model\"].get(\"serializedFile\") is None:\n            raise RuntimeError(\"serializedFile
+    is not defined\")\n\n        serialized_file = self.manifest[\"model\"][\"serializedFile\"]\n
+    \       zip_path = os.path.join(model_dir, serialized_file)\n\n        with tempfile.TemporaryDirectory(dir=model_dir)
+    as expandedmodel:\n            logger.info(\"extract %s to %s...\", zip_path,
+    expandedmodel)\n            with zipfile.ZipFile(zip_path, \"r\") as zip_ref:\n
+    \               zip_ref.extractall(expandedmodel)\n            pipe = StableDiffusionPipeline.from_pretrained(expandedmodel,
+    torch_dtype=torch.float16)\n\n        self.model = pipe.to(self.device)\n        logger.debug(\"model
+    loaded successfully\")\n        self.initialized = True\n    \n    def preprocess(self,
+    data):\n        logger.info(\"input data = %s\", data)\n        return [str(el.get('data'))
+    for el in data]\n    \n    def inference(self, model_input):\n        logger.info(\"inference
+    model input = %s\", model_input)\n        if model_input is None:\n            raise
+    RuntimeError('model input is None')\n\n        return self.model(model_input).images\n\n
+    \   def postprocess(self, res):\n        logger.info('res = %s', res)\n        output
+    = []\n        for result in res:\n            bytes = io.BytesIO()\n            result.save(bytes,
+    format='JPEG')\n            output.append(base64.b64encode(bytes.getvalue()).decode('ascii'))\n
+    \       return output\n"
+  requirements.txt: |
+    diffusers
+    accelerate
+kind: ConfigMap
+metadata:
+  labels:
+    job: setup-s3
+  name: setup-s3

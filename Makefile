@@ -1,13 +1,18 @@
 PROJ=demo
 IMAGE=ghcr.io/kwkoo/kserve-sd-frontend
+S3_IMAGE=ghcr.io/kwkoo/s3-utils
 BUILDERNAME=multiarch-builder
 
 BASE:=$(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: deploy ensure-logged-in configure-user-workload-monitoring deploy-nfd deploy-nvidia deploy-kserve-dependencies deploy-oai deploy-minio upload-model deploy-yolo deploy-frontend clean-frontend minio-console clean-minio frontend-image
+
+.PHONY: deploy
+deploy: ensure-logged-in deploy-infra upload-model deploy-sd deploy-frontend
+	@echo 'done'
+
 
 .PHONY: deploy-infra
-deploy-infra: ensure-logged-in configure-user-workload-monitoring deploy-nvidia deploy-kserve-dependencies deploy-oai deploy-minio
+deploy-infra: configure-user-workload-monitoring deploy-nvidia deploy-kserve-dependencies deploy-oai deploy-minio
 	@echo "installation complete"
 
 
@@ -156,6 +161,29 @@ deploy-minio:
 	  MINIO_BROWSER_REDIRECT_URL="http://`oc get -n $(PROJ) route/minio-console -o jsonpath='{.spec.host}'`"
 
 
+.PHONY: upload-model
+upload-model:
+	@echo "removing any previous jobs..."
+	-oc delete -n $(PROJ) -f $(BASE)/yaml/s3-job.yaml || echo "nothing to delete"
+	@/bin/echo -n "waiting for job to go away..."
+	@while [ `oc get -n $(PROJ) --no-headers job/setup-s3 2>/dev/null | wc -l` -gt 0 ]; do \
+	  /bin/echo -n "."; \
+	done
+	@echo "done"
+	@echo "creating job to upload model to S3..."
+	oc apply -n $(PROJ) -f $(BASE)/yaml/s3-job.yaml
+	@/bin/echo -n "waiting for pod to show up..."
+	@while [ `oc get -n $(PROJ) po -l job=setup-s3 --no-headers 2>/dev/null | wc -l` -lt 1 ]; do \
+	  /bin/echo -n "."; \
+	  sleep 5; \
+	done
+	@echo "done"
+	@/bin/echo "waiting for pod to be ready..."
+	oc wait -n $(PROJ) `oc get -n $(PROJ) po -o name -l job=setup-s3` --for=condition=Ready --timeout=300s
+	oc logs -n $(PROJ) -f job/setup-s3
+	oc delete -n $(PROJ) -f $(BASE)/yaml/s3-job.yaml
+
+
 .PHONY: deploy-sd
 deploy-sd:
 	@/bin/echo -n "waiting for ServingRuntime CRD..."
@@ -243,4 +271,36 @@ frontend-image:
 	  --amend $(IMAGE):amd64 \
 	  --amend $(IMAGE):arm64
 	docker manifest push --purge $(IMAGE):latest
+
+
+.PHONY: s3-image
+s3-image:
+	-mkdir -p $(BASE)/docker-cache/amd64 $(BASE)/docker-cache/arm64 2>/dev/null
+	docker buildx use $(BUILDERNAME) || docker buildx create --name $(BUILDERNAME) --use
+	docker buildx build \
+	  --push \
+	  --provenance false \
+	  --sbom false \
+	  --platform=linux/amd64 \
+	  --cache-to type=local,dest=$(BASE)/docker-cache/amd64,mode=max \
+	  --cache-from type=local,src=$(BASE)/docker-cache/amd64 \
+	  --rm \
+	  -t $(S3_IMAGE):amd64 \
+	  $(BASE)/s3-utils
+	docker buildx build \
+	  --push \
+	  --provenance false \
+	  --sbom false \
+	  --platform=linux/arm64 \
+	  --cache-to type=local,dest=$(BASE)/docker-cache/arm64,mode=max \
+	  --cache-from type=local,src=$(BASE)/docker-cache/arm64 \
+	  --rm \
+	  -t $(S3_IMAGE):arm64 \
+	  $(BASE)/s3-utils
+	docker manifest create \
+	  $(S3_IMAGE):latest \
+	  --amend $(S3_IMAGE):amd64 \
+	  --amend $(S3_IMAGE):arm64
+	docker manifest push --purge $(S3_IMAGE):latest
+	@#docker build --rm -t $(S3_IMAGE) $(BASE)/s3-utils
 
