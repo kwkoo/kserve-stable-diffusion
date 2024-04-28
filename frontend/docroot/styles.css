@@ -34,6 +34,11 @@
     margin-right: auto;
 }
 
+#prompt {
+    font-size: 2em;
+    padding: 10px;
+}
+
 #spinner, #model-image {
     display: none;
     margin-top: 10px;
